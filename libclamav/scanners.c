@@ -213,6 +213,99 @@ static cl_error_t cli_unrar_scanmetadata(unrar_metadata_t *metadata, cli_ctx *ct
     return status;
 }
 
+/**
+ * @brief Check that the data at `offset` starts with a RAR 1.5 - 4.x archive.
+ *
+ * The file type magic for embedded RAR archives (RAR-SFX) matches only the 7-byte
+ * marker block, which also shows up as plain data in non-RAR files. Go binaries
+ * that link net/http, for example, carry it in their MIME sniffing table.
+ * The UnRAR module is deliberately permissive with damaged archives, so without
+ * this check whatever bytes follow a stray marker get parsed as RAR file headers,
+ * and their bogus sizes or flags may raise Heuristics.Limits.Exceeded.* or
+ * Heuristics.Encrypted.RAR alerts.
+ *
+ * Only the main archive header is verified: it must directly follow the marker,
+ * be of the right type and size, and have a correct header CRC. Later blocks are
+ * intentionally not checked because UnRAR tolerates damaged members, RAR 2.x/3.x
+ * archives need no end-of-archive block, and several block types are exempt from
+ * CRC verification.
+ *
+ * @param ctx       Scan context.
+ * @param offset    Offset of the RAR marker within ctx->fmap.
+ * @return cl_error_t CL_SUCCESS if it looks like a RAR archive, else CL_EFORMAT.
+ */
+static cl_error_t cli_unrar_header_check(cli_ctx *ctx, size_t offset)
+{
+    /* RAR 1.5 - 4.x marker block: "Rar!" 0x1a 0x07 0x00 */
+    static const uint8_t rar_marker[] = {0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x00};
+    const size_t marker_size          = sizeof(rar_marker);
+
+    const uint8_t head_main       = 0x73;   /* HEAD3_MAIN */
+    const uint16_t mhd_comment    = 0x0002; /* MHD_COMMENT: RAR 2.x comment stored inside the main header */
+    const size_t main_header_size = 13;     /* SIZEOF_MAINHEAD3 */
+
+    const uint8_t *header = NULL;
+    uint16_t head_crc, flags, head_size, crc_len;
+
+    if (NULL == ctx || NULL == ctx->fmap) {
+        return CL_ENULLARG;
+    }
+
+    if (ctx->fmap->len < offset + marker_size + main_header_size) {
+        cli_dbgmsg("cli_unrar_header_check: not enough data for a RAR marker and main header\n");
+        return CL_EFORMAT;
+    }
+
+    header = fmap_need_off_once(ctx->fmap, offset, marker_size + main_header_size);
+    if (NULL == header) {
+        return CL_EFORMAT;
+    }
+
+    if (0 != memcmp(header, rar_marker, marker_size)) {
+        cli_dbgmsg("cli_unrar_header_check: RAR marker not found\n");
+        return CL_EFORMAT;
+    }
+
+    /* Main header block: HEAD_CRC(2) HEAD_TYPE(1) HEAD_FLAGS(2) HEAD_SIZE(2) HighPosAV(2) PosAV(4) */
+    header += marker_size;
+    head_crc  = le16_to_host(cli_readint16(header));
+    flags     = le16_to_host(cli_readint16(header + 3));
+    head_size = le16_to_host(cli_readint16(header + 5));
+
+    if (head_main != header[2]) {
+        cli_dbgmsg("cli_unrar_header_check: main header does not follow the marker (block type 0x%02x)\n", header[2]);
+        return CL_EFORMAT;
+    }
+
+    if (head_size < main_header_size) {
+        cli_dbgmsg("cli_unrar_header_check: main header size too small (%u)\n", head_size);
+        return CL_EFORMAT;
+    }
+
+    if (ctx->fmap->len - (offset + marker_size) < head_size) {
+        cli_dbgmsg("cli_unrar_header_check: main header extends past end of data\n");
+        return CL_EFORMAT;
+    }
+
+    header = fmap_need_off_once(ctx->fmap, offset + marker_size, head_size);
+    if (NULL == header) {
+        return CL_EFORMAT;
+    }
+
+    /*
+     * The header CRC is the low 16 bits of a CRC32 over the block, excluding the CRC field.
+     * For RAR 2.x main headers with an embedded comment, UnRAR only reads and
+     * checksums the fixed 13-byte prefix, so do the same.
+     */
+    crc_len = (flags & mhd_comment) ? main_header_size : head_size;
+    if ((crc32(0, header + 2, crc_len - 2) & 0xffff) != head_crc) {
+        cli_dbgmsg("cli_unrar_header_check: main header CRC mismatch\n");
+        return CL_EFORMAT;
+    }
+
+    return CL_SUCCESS;
+}
+
 static cl_error_t cli_scanrar_file(const char *filepath, int desc, cli_ctx *ctx)
 {
     cl_error_t status          = CL_EPARSE;
@@ -3891,7 +3984,13 @@ static cl_error_t scanraw(cli_ctx *ctx, cli_file_t type, uint8_t typercg, cli_fi
                         case CL_TYPE_RARSFX:
                             if ((have_rar && SCAN_PARSE_ARCHIVE && (DCONF_ARCH & ARCH_CONF_RAR)) &&
                                 (type != CL_TYPE_RAR)) {
-                                // TODO: Add header validity check to prevent false positives from being scanned.
+                                // Header validity check to prevent false positives from being scanned.
+                                ret = cli_unrar_header_check(ctx, fpt->offset);
+                                if (ret != CL_SUCCESS) {
+                                    cli_dbgmsg("RAR header check failed: %s (%d)\n", cl_strerror(ret), ret);
+                                    break;
+                                }
+
                                 nret = cli_magic_scan_nested_fmap_type(
                                     ctx->fmap,
                                     fpt->offset,

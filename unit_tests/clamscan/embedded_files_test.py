@@ -105,6 +105,61 @@ class TC(testcase.TestCase):
         ]
         self.verify_output(output.out, expected=expected_stdout, unexpected=unexpected_stdout)
 
+    def test_embedded_rars(self):
+        self.step_name('Test that clamav can successfully extract and alert on multiple embedded RAR files')
+
+        path_db = TC.path_source / 'unit_tests' / 'input' / 'embedded_testfiles' / 'signatures'
+        testfiles = TC.path_source / 'unit_tests' / 'input' / 'embedded_testfiles' / 'test.png.emb-rars'
+
+        command = '{valgrind} {valgrind_args} {clamscan} -d {path_db} {testfiles} --gen-json --debug --allmatch'.format(
+            valgrind=TC.valgrind, valgrind_args=TC.valgrind_args, clamscan=TC.clamscan,
+            path_db=path_db,
+            testfiles=testfiles,
+        )
+        output = self.execute_command(command)
+
+        assert output.ec == 1  # no virus, no failures
+
+        expected_stdout = [
+            'test.png.emb-rars: test-file-1-1.UNOFFICIAL FOUND',
+            'test.png.emb-rars: test-file-1-2.UNOFFICIAL FOUND',
+            'test.png.emb-rars: test-file-2-1.UNOFFICIAL FOUND',
+            'test.png.emb-rars: test-file-2-2.UNOFFICIAL FOUND',
+        ]
+        unexpected_stdout = [
+            testcase.CLEAN_SCAN_RESULT,
+        ]
+        self.verify_output(output.out, expected=expected_stdout, unexpected=unexpected_stdout)
+
+    def test_embedded_rar_marker_false_positive(self):
+        self.step_name('Test that a RAR marker followed by header-shaped bytes with bad CRCs is not scanned as an embedded RAR')
+
+        # Go binaries that link net/http carry the RAR marker in their MIME-sniffing table.
+        # Without the header check, whatever bytes followed the marker were parsed as RAR
+        # file headers and their bogus sizes raised Heuristics.Limits.Exceeded.* alerts
+        # when --alert-exceeds-max was enabled (GitHub issues #1143 and #1147).
+        path_db = TC.path_source / 'unit_tests' / 'input' / 'embedded_testfiles' / 'signatures'
+        testfiles = TC.path_source / 'unit_tests' / 'input' / 'embedded_testfiles' / 'test.png.emb-rar-false-positive'
+
+        command = '{valgrind} {valgrind_args} {clamscan} -d {path_db} {testfiles} --gen-json --debug --allmatch --alert-exceeds-max --max-filesize=64M --max-scansize=64M'.format(
+            valgrind=TC.valgrind, valgrind_args=TC.valgrind_args, clamscan=TC.clamscan,
+            path_db=path_db,
+            testfiles=testfiles,
+        )
+        output = self.execute_command(command)
+
+        assert output.ec == 0  # clean, no failures
+
+        expected_stdout = [
+            testcase.CLEAN_SCAN_RESULT,
+        ]
+        unexpected_stdout = [
+            'Heuristics.Limits.Exceeded',
+            'Heuristics.Encrypted.RAR',
+            'FOUND',
+        ]
+        self.verify_output(output.out, expected=expected_stdout, unexpected=unexpected_stdout)
+
     def test_embedded_exes(self):
         self.step_name('Test that clamav can successfully extract and alert on multiple embedded EXE files')
 
